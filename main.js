@@ -4,7 +4,7 @@ const bunyan = require('bunyan')
 const Promise = require('bluebird')
 const _ = require('lodash')
 
-const log = bunyan.createLogger({ name: "delete-vpc", level: 'trace', stream: process.stderr })
+let log
 
 const efs = new AWS.EFS({ apiVersion: '2015-02-01', region: process.env.AWS_REGION })
 const ec2 = new AWS.EC2({ apiVersion: '2016-11-15' })
@@ -14,10 +14,14 @@ const yargsFunc = (yargs) => {
   yargs.positional('vpc-id', { describe: 'ID of the VPC', default: null })
   // TODO: Implement on all functions
   // yargs.positional('dry-run', { describe: 'Don\' actually delete anything', default: false })
+  yargs.positional('log-level', { describe: 'Log level (debug, trace, info, warn, error)', default: 'error' })
+  yargs.positional('log-to-stdout', { describe: 'Output logs to STDOUT instead of STDERR', default: false })
 }
 
 yargs
   .command('delete', 'Delete the VPC', yargsFunc, async (argv) => {
+    const stream = argv.logToStdout ? process.stdout : process.stderr
+    log = bunyan.createLogger({ name: "delete-vpc", level: argv.logLevel, stream  })
     // TODO: This should get all resources it deleted and print them out to STDOUT
     await deleteEC2Instances(argv.vpcId, argv.dryRun) // Remove Instances
     await deleteELBs(argv.vpcId, argv.dryRun) // Remove Load Balancers
@@ -30,13 +34,14 @@ yargs
     await deleteSubnets(argv.vpcId, argv.dryRun)
     await deleteRouteTables(argv.vpcId, argv.dryRun)
     await deleteVPC(argv.vpcId, argv.dryRun) // Remove VPC
+    console.log('VPC Deleted')
     return true
   })
   .argv
 
 async function deleteEC2Instances(vpcId, DryRun) {
   this.log = log.child({ methods: 'deleteEC2Instances', vpcId });
-  this.log.info('Start')
+  this.log.trace('Start deleting EC2 instances')
   const filterParams = {
     Filters: [
     {
@@ -58,13 +63,7 @@ async function deleteEC2Instances(vpcId, DryRun) {
   }
   const deleteParams = { InstanceIds, DryRun }
   this.log.trace('DeleteParams', { deleteParams })
-  let response
-  try {
-    response = await Promise.fromCallback(cb => ec2.terminateInstances(deleteParams, cb))
-    this.log.info('Response', { response })
-  } catch (err) {
-    this.log.info('Error terminating instances', { err: err.message, code: err.code })
-  }
+  return $(ec2, 'terminateInstances', deleteParams)
 }
 
 async function deleteELBs(vpcId, DryRun) {
@@ -81,13 +80,13 @@ async function deleteELBs(vpcId, DryRun) {
       this.log.info('Dry run. Deleteing ELB', { name: elbInstance.LoadBalancerName })
       return
     }
-    return await Promise.fromCallback(cb => elb.deleteLoadBalancer(deleteParams, cb))
+    return await $(elb, 'deleteLoadBalancer', deleteParams)
   })
 }
 
 async function deleteInternetGateways(VpcId, DryRun) {
   this.log = log.child({ methods: 'deleteInternetGateways', VpcId, DryRun });
-  this.log.trace('Start')
+  this.log.trace('Start deleting internet gateways')
   const params = {
     Filters: [
       {
@@ -98,17 +97,13 @@ async function deleteInternetGateways(VpcId, DryRun) {
   };
   const response = await Promise.fromCallback(cb => ec2.describeInternetGateways(params, cb))
   const InternetGatewayIds = response.InternetGateways.map(x => x.InternetGatewayId)
-  this.log.info('Internet Gateway Ids', { InternetGatewayIds })
+  this.log.trace('Internet Gateway Ids', { InternetGatewayIds })
 
   await Promise.map(InternetGatewayIds, async (InternetGatewayId) => {
     const params = { InternetGatewayId, DryRun };
     const detachParams = Object.assign({}, params, { VpcId })
-    try {
-      await Promise.fromCallback(cb => ec2.detachInternetGateway(detachParams, cb));
-      await Promise.fromCallback(cb => ec2.deleteInternetGateway(params, cb));
-    } catch (err) {
-      this.log.error('Error deleting internet gateway', { Error: err.message, code: err.code })
-    }
+    await $(ec2, 'detachInternetGateway', detachParams)
+    await $(ec2, 'deleteInternetGateway', params)
   })
   this.log.trace(`InternetGateways succesfuly deleted DryRun: ${DryRun}`)
   return InternetGatewayIds
@@ -132,7 +127,7 @@ async function deleteEFS (vpcId, DryRun) {
   await Promise.map(mountTargetsToBeDeleted, async (mountTarget) => {
     const params = { MountTargetId: mountTarget.MountTargetId }
     this.log.trace('Delete File System', { params })
-    return await Promise.fromCallback(cb => efs.deleteMountTarget(params, cb))
+    return await $(efs, 'deleteMountTarget', params)
   })
   // NOTE: This will delete any EFS with a mount target in the subet. Very greedy
   // Ideally it would only delete EFS with all mount targets in a VPC
@@ -140,7 +135,7 @@ async function deleteEFS (vpcId, DryRun) {
   await Promise.map(fileSystemsToBeDeleted, async (FileSystemId) => {
     const params = { FileSystemId }
     this.log.trace('Delete File System', { FileSystemId })
-    return await Promise.fromCallback(cb => efs.deleteFileSystem(params, cb))
+    return await $(efs, 'deleteFileSystem', params, { retryErrorCodes: 'FileSystemInUse' })
   })
 }
 
@@ -160,11 +155,7 @@ async function deleteNATGateways(vpcId, DryRun) {
 
   return await Promise.map(NatGatewayIds, async (NatGatewayId) => {
     const params = { NatGatewayId };
-    try {
-      await Promise.fromCallback(cb => ec2.deleteNatGateway(params, cb));
-    } catch (err) {
-      this.log.error('Error deleting NAT Gateway', { Error: err.message, code: err.code })
-    }
+    await $(ec2, 'deleteNatGateway', params)
   })
 }
 
@@ -189,7 +180,7 @@ async function deleteSubnets (VpcId, DryRun) {
   await Promise.map(subnetIds, async (SubnetId) => {
     const params = {SubnetId, DryRun}
     this.log.trace('Deleting subnet', { SubnetId })
-    return await Promise.fromCallback(cb => ec2.deleteSubnet(params, cb))
+    await $(ec2, 'deleteSubnet', params, { retryErrorCodes: 'DependencyViolation' })
   })
 }
 
@@ -197,16 +188,7 @@ async function deleteVPC (VpcId, DryRun) {
   this.log = log.child({ methods: 'deleteVPC', VpcId: VpcId || 'nothing', DryRun });
   this.log.trace('Start deleting VPC')
   const params = { VpcId, DryRun };
-  try {
-    await Promise.fromCallback(cb => ec2.deleteVpc(params, cb));
-  } catch (err){
-    if (err.code !== 'InvalidVpcID.NotFound') {
-      if (DryRun) {
-        this.log.info('Error deleting VPC', { err: err.message, code: err.code })
-      }
-      this.log.error('Error deleting VPC', { err: err.message, code: err.code })
-    }
-  }
+  await $(ec2, 'deleteVpc', params, { allowedErrorCodes: 'InvalidVpcID.NotFound' })
   this.log.info('VPC Deleted')
 }
 
@@ -227,18 +209,16 @@ async function deleteSecurityGroups (vpcId, DryRun) {
       rule.GroupId = securityGroup.GroupId
       if (!_.isEmpty(ruleUnfiltered.IpRanges)) {
         const ipRange = ruleUnfiltered.IpRanges[0]
+        rule.IpProtocol = ruleUnfiltered.IpProtocol
+        rule.FromPort = ruleUnfiltered.FromPort
+        rule.ToPort = ruleUnfiltered.ToPort
         rule.CidrIp = ipRange.CidrIp
       }
       if (!_.isEmpty(ruleUnfiltered.UserIdGroupPairs)) {
-        rule.IpPermissions = [Object.assign({}, ruleUnfiltered)]
+        rule.IpPermissions = [ _.pick(ruleUnfiltered, ['IpProtocol', 'UserIdGroupPairs', 'FromPort', 'ToPort']) ]
       }
-      this.log.trace('Delete Ingress Rule', { rule })
-      try {
-        await Promise.fromCallback(cb => ec2.revokeSecurityGroupIngress(rule, cb))
-        this.log.trace('Ingress Rule deleted', { rule })
-      } catch (err) {
-        this.log.trace('Could not delete SG ingress rule', { rule, err: err.message, code: err.code })
-      }
+      this.log.trace('Delete Ingress Rule', { rule, ruleUnfiltered })
+      await $(ec2, 'revokeSecurityGroupIngress', rule)
     })
     return
   })
@@ -247,7 +227,7 @@ async function deleteSecurityGroups (vpcId, DryRun) {
   await Promise.delay(1000)
   await Promise.map(sgIds, async function (GroupId) {
     const params = { GroupId, DryRun }
-    return await Promise.fromCallback(cb => ec2.deleteSecurityGroup(params, cb))
+    return await $(ec2, 'deleteSecurityGroup', params)
   })
 }
 
@@ -267,21 +247,11 @@ async function deleteNetworkInterfaces (VpcId, DryRun) {
   const networkInterfaceAttachmentIds = response.NetworkInterfaces.map(x => _.get(x, 'Attachment.AttachmentId')).filter(x => !!x)
   await Promise.map(networkInterfaceAttachmentIds, async (AttachmentId) => {
     const detachParams = { AttachmentId, Force: true, DryRun }
-    try {
-      await Promise.fromCallback(cb => ec2.detachNetworkInterface(detachParams, cb))
-    } catch (err) {
-      this.log.trace('Error deleting network interface attachment', { detachParams, err: err.message, code: err.code })
-    }
+    await $(ec2, 'detachNetworkInterface', detachParams, { allowedErrorCodes: 'OperationNotPermitted' })
   })
   await Promise.map(networkInterfaceIds, async (NetworkInterfaceId) => {
-    const params = { DryRun, NetworkInterfaceId }
-    try {
-      await Promise.fromCallback(cb => ec2.deleteNetworkInterface(params, cb))
-    } catch (err) {
-      if (err.code !== 'InvalidNetworkInterfaceID.NotFound') {
-        this.log.error('Could not delete network interface', { err: err.message , code: err.code})
-      }
-    }
+    const deleteParams = { DryRun, NetworkInterfaceId }
+    return $(ec2, 'deleteNetworkInterface', deleteParams, { allowedErrorCodes: 'InvalidNetworkInterfaceID.NotFound' })
   })
 }
 
@@ -300,12 +270,33 @@ async function deleteRouteTables (VpcId, DryRun) {
   const routeTableIds = response.RouteTables.map(x => x.RouteTableId)
   return await Promise.map(routeTableIds, async (RouteTableId) => {
     const query = { RouteTableId, DryRun }
-    try {
-      await Promise.fromCallback(cb => ec2.deleteRouteTable(query, cb))
-    } catch (err) {
-      if (err.code !== 'DependencyViolation') {
-        this.log.error('Could not delete Rout table')
-      }
-    }
+    return $(ec2, 'deleteRouteTable', query, { allowedErrorCodes: 'DependencyViolation' })
   })
+}
+
+async function $(classInstance, methodName, query, opts = {}) {
+  this.log = log.child({ methods: '$', endpoint: classInstance.endpoint.host, methodName, query, opts });
+  const className = classInstance.endpoint.host.split('.')[0]
+  let result
+  try {
+    result = await Promise.fromCallback(cb => classInstance[methodName](query, cb))
+  } catch (err) {
+    if (opts.retryErrorCodes && opts.retryErrorCodes.includes(err.code)) {
+      opts.retries = ((_.isNumber(opts.retries) ? opts.retries : 6) - 1)
+      if (opts.retries <= 0) {
+        this.log.error('No retries left', { retries: opts.retries, errorCode: err.code })
+        throw err
+      }
+      this.log.trace('Retrying', { retries: opts.retries, errorCode: err.code })
+      await Promise.delay(opts.retryDelay || 2000)
+      return $(classInstance, methodName, query, opts)
+    }
+    if (opts.allowedErrorCodes && opts.allowedErrorCodes.includes(err.code)) {
+      this.log.trace('Allowed Error', { errorCode: err.code })
+      return
+    }
+    this.log.error(`Error executing ${className}.${methodName}`, { errorCode: err.code })
+    throw err
+  }
+  return result
 }
