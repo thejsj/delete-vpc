@@ -6,7 +6,9 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "bin" : { "delete-vpc" : "./main.js" },
+  "bin": {
+    "delete-vpc": "./main.js"
+  },
   "author": "",
   "license": "ISC",
   "dependencies": {

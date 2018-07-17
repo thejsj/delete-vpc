@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 const yargs = require('yargs')
 const AWS = require('aws-sdk')
 const bunyan = require('bunyan')
@@ -14,12 +16,10 @@ const yargsFunc = (yargs) => {
   yargs.positional('vpc-id', { describe: 'ID of the VPC', default: null })
   // TODO: Implement on all functions
   // yargs.positional('dry-run', { describe: 'Don\' actually delete anything', default: false })
-  yargs.positional('log-level', { describe: 'Log level (debug, trace, info, warn, error)', default: 'error' })
-  yargs.positional('log-to-stdout', { describe: 'Output logs to STDOUT instead of STDERR', default: false })
 }
 
 yargs
-  .command('delete', 'Delete the VPC', yargsFunc, async (argv) => {
+  .command('delete [vpc-id]', 'Delete the VPC and all dependencies', yargsFunc, async (argv) => {
     const stream = argv.logToStdout ? process.stdout : process.stderr
     log = bunyan.createLogger({ name: "delete-vpc", level: argv.logLevel, stream  })
     // TODO: This should get all resources it deleted and print them out to STDOUT
@@ -37,6 +37,8 @@ yargs
     console.log('VPC Deleted')
     return true
   })
+  .option('log-level', { describe: 'Log level (debug, trace, info, warn, error)', default: 'error' })
+  .option('log-to-stdout', { describe: 'Output logs to STDOUT instead of STDERR', default: false })
   .argv
 
 async function deleteEC2Instances(vpcId, DryRun) {
@@ -111,16 +113,23 @@ async function deleteInternetGateways(VpcId, DryRun) {
 
 async function deleteEFS (vpcId, DryRun) {
   this.log = log.child({ methods: 'deleteEFS', vpcId, DryRun });
-  this.log.trace('Start')
+  this.log.trace('Start deleting EFS Filesystems')
   const response = await Promise.fromCallback(cb => efs.describeFileSystems({}, cb))
   const fileSystemIds = response.FileSystems.map(x => x.FileSystemId)
+  this.log.trace('fileSystemIds', { fileSystemIds })
   const mountTargets = await Promise.reduce(fileSystemIds, async (memo, FileSystemId) => {
     const params = { FileSystemId }
     const response = await Promise.fromCallback(cb => efs.describeMountTargets(params, cb))
+    this.log.trace('memoLength', { length: memo.length, super: response.MountTargets.length })
     return [].concat(memo).concat(response.MountTargets)
   }, [])
   const subnetIds = await getSubnetIds(vpcId)
-  const mountTargetsToBeDeleted = mountTargets.filter(x => subnetIds.includes(x.SubnetId))
+  this.log.trace('mountTargets', { mountTargets })
+  this.log.trace('subnetIds', { subnetIds })
+  const mountTargetsToBeDeleted = mountTargets.filter(x => {
+    this.log.trace('SubnetId', { SubnetId: x.SubnetId })
+    return subnetIds.includes(x.SubnetId)
+  })
   this.log.trace('mountTargetsToBeDeleted', { mountTargetsToBeDeleted })
   const fileSystemsToBeDeleted = _.uniq(mountTargetsToBeDeleted.map(x => x.FileSystemId))
   this.log.trace('fileSystemsToBeDeleted', { fileSystemsToBeDeleted })
@@ -135,7 +144,7 @@ async function deleteEFS (vpcId, DryRun) {
   await Promise.map(fileSystemsToBeDeleted, async (FileSystemId) => {
     const params = { FileSystemId }
     this.log.trace('Delete File System', { FileSystemId })
-    return await $(efs, 'deleteFileSystem', params, { retryErrorCodes: 'FileSystemInUse' })
+    return await $(efs, 'deleteFileSystem', params, { retryErrorCodes: 'FileSystemInUse', retries: 10 })
   })
 }
 
