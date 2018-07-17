@@ -2,18 +2,25 @@
 
 Easily delete a VPC and all it's dependencies.
 
-No more of this...
+---
+
+*No more of this...*
 
 ![Alt text](images/1.png)
 
-or this..
+*or this..*
 
 ![Alt text](images/2.png)
 
-or this..
+*or this..*
 
 ![Alt text](images/3.png)
 
+# Installation
+
+```
+npm i -g delete-vpc
+```
 
 # Usage
 
