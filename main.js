@@ -35,7 +35,6 @@ yargs
     await deleteRouteTables(argv.vpcId, argv.dryRun)
     await deleteVPC(argv.vpcId, argv.dryRun) // Remove VPC
     console.log('VPC Deleted')
-    return true
   })
   .option('log-level', { describe: 'Log level (debug, trace, info, warn, error)', default: 'error' })
   .option('log-to-stdout', { describe: 'Output logs to STDOUT instead of STDERR', default: false })
@@ -256,11 +255,11 @@ async function deleteNetworkInterfaces (VpcId, DryRun) {
   const networkInterfaceAttachmentIds = response.NetworkInterfaces.map(x => _.get(x, 'Attachment.AttachmentId')).filter(x => !!x)
   await Promise.map(networkInterfaceAttachmentIds, async (AttachmentId) => {
     const detachParams = { AttachmentId, Force: true, DryRun }
-    await $(ec2, 'detachNetworkInterface', detachParams, { allowedErrorCodes: 'OperationNotPermitted' })
+    await $(ec2, 'detachNetworkInterface', detachParams, { allowedErrorCodes: 'OperationNotPermitted', unHandledErrorCodes: 'AuthFailure' })
   })
   await Promise.map(networkInterfaceIds, async (NetworkInterfaceId) => {
     const deleteParams = { DryRun, NetworkInterfaceId }
-    return $(ec2, 'deleteNetworkInterface', deleteParams, { allowedErrorCodes: 'InvalidNetworkInterfaceID.NotFound' })
+    return $(ec2, 'deleteNetworkInterface', deleteParams, { allowedErrorCodes: 'InvalidNetworkInterfaceID.NotFound', unHandledErrorCodes: 'AuthFailure' })
   })
 }
 
@@ -303,6 +302,10 @@ async function $(classInstance, methodName, query, opts = {}) {
     if (opts.allowedErrorCodes && opts.allowedErrorCodes.includes(err.code)) {
       this.log.trace('Allowed Error', { errorCode: err.code })
       return
+    }
+    if (opts.unHandledErrorCodes && && opts.unHandledErrorCodes.includes(err.code)) {
+      this.log.error('Unhandled Error. This error is unhanlded and cannot be fixed by re-running this command. Log in to the AWS console and check what other resources are tied this resource.', { errorCode: err.code })
+      throw err
     }
     this.log.error(`Error executing ${className}.${methodName}`, { errorCode: err.code })
     throw err
